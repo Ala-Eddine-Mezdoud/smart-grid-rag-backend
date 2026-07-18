@@ -1,0 +1,18 @@
+# Files not uploaded to Cloud Build by `gcloud run deploy --source`.
+# The prebuilt db/ and papers/ are intentionally NOT ignored so they ship in the image.
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+.env
+.env.*
+.flashrank/
+node_modules/
