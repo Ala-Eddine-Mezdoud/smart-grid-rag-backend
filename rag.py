@@ -2,6 +2,10 @@
 
 Both the terminal client (chat.py) and the FastAPI server (server.py) use this so
 that retrieval, the grounding prompt, and answer generation stay identical.
+
+Retrieval uses Google embeddings (via langchain) + BM25 + a cross-encoder reranker.
+Generation uses the google-genai Interactions API (the legacy generateContent endpoint
+has been retired for newer API projects).
 """
 
 from __future__ import annotations
@@ -12,17 +16,17 @@ from typing import Iterator
 
 from dotenv import load_dotenv
 from flashrank import Ranker, RerankRequest
+from google import genai
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 DB_DIR = Path(__file__).parent / "db"
 PAPERS_DIR = Path(__file__).parent / "papers"
 COLLECTION_NAME = "smart_grid_papers"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-CHAT_MODEL = "gemini-2.5-flash"
+CHAT_MODEL = "gemini-3.5-flash"
 
 # Hybrid retrieval: dense (Chroma) + sparse (BM25) candidates are fused with
 # reciprocal rank fusion, then a cross-encoder reranker keeps the best TOP_K.
@@ -40,37 +44,24 @@ HISTORY_CHAR_LIMIT = 600
 
 UNAVAILABLE_MESSAGE = "The information is not available in the provided documents."
 
-PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a research assistant answering questions about a corpus of smart grid "
-            "research papers.\n"
-            "Answer ONLY using the numbered context passages below. Do not rely on any outside "
-            "knowledge. If the context does not contain the answer, reply exactly: "
-            f'"{UNAVAILABLE_MESSAGE}"\n'
-            "Cite every claim with the bracketed number(s) of the passage(s) that support it, "
-            "e.g. [1] or [2][3], placed immediately after the claim. Use ONLY these bracket "
-            "number markers for citations — never write file names or page numbers in your "
-            "prose. Use markdown (headings, lists, bold) when it improves readability.\n\n"
-            "Context:\n{context}",
-        ),
-        ("human", "{question}"),
-    ]
+SYSTEM_INSTRUCTION = (
+    "You are a research assistant answering questions about a corpus of smart grid "
+    "research papers.\n"
+    "Answer ONLY using the numbered context passages provided in the user's message. Do "
+    "not rely on any outside knowledge. If the context does not contain the answer, reply "
+    f'exactly: "{UNAVAILABLE_MESSAGE}"\n'
+    "Cite every claim with the bracketed number(s) of the passage(s) that support it, e.g. "
+    "[1] or [2][3], placed immediately after the claim. Use ONLY these bracket number "
+    "markers for citations — never write file names or page numbers in your prose. Use "
+    "markdown (headings, lists, bold) when it improves readability."
 )
 
-CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You rewrite a user's follow-up question into a standalone question that can be "
-            "understood without the prior conversation. Resolve pronouns and implicit "
-            'references ("it", "that", "the second one") using the history, and keep the '
-            "user's intent and terminology. If the question is already standalone, return it "
-            "unchanged. Return ONLY the rewritten question, with no preamble or quotes.",
-        ),
-        ("human", "Conversation so far:\n{history}\n\nFollow-up question: {question}"),
-    ]
+CONDENSE_SYSTEM = (
+    "You rewrite a user's follow-up question into a standalone question that can be "
+    "understood without the prior conversation. Resolve pronouns and implicit references "
+    '("it", "that", "the second one") using the history, and keep the user\'s intent and '
+    "terminology. If the question is already standalone, return it unchanged. Return ONLY "
+    "the rewritten question, with no preamble or quotes."
 )
 
 
@@ -155,8 +146,12 @@ def format_context(docs: list[Document]) -> str:
     return "\n\n".join(parts)
 
 
+def _build_input(question: str, docs: list[Document]) -> str:
+    return f"Context:\n{format_context(docs)}\n\nQuestion: {question}"
+
+
 class RagEngine:
-    """Loads the vector store and LLM once and answers questions against them."""
+    """Loads the vector store and generation client once and answers against them."""
 
     def __init__(self, top_k: int = TOP_K) -> None:
         load_dotenv()
@@ -189,7 +184,9 @@ class RagEngine:
             )
         except Exception:
             self.reranker = None
-        self.llm = ChatGoogleGenerativeAI(model=CHAT_MODEL, temperature=0)
+
+        # Generation via the Interactions API (reads GEMINI_API_KEY from the environment).
+        self.client = genai.Client()
 
     def condense_question(
         self, question: str, history: list[dict] | None = None
@@ -212,11 +209,12 @@ class RagEngine:
         if not lines:
             return question
 
-        messages = CONDENSE_PROMPT.invoke(
-            {"history": "\n".join(lines), "question": question}
+        result = self.client.interactions.create(
+            model=CHAT_MODEL,
+            input=f"Conversation so far:\n{chr(10).join(lines)}\n\nFollow-up question: {question}",
+            system_instruction=CONDENSE_SYSTEM,
         )
-        rewritten = self.llm.invoke(messages).content
-        rewritten = rewritten.strip() if isinstance(rewritten, str) else ""
+        rewritten = (result.output_text or "").strip()
         return rewritten or question
 
     def retrieve(self, question: str) -> list[Document]:
@@ -242,8 +240,10 @@ class RagEngine:
 
     def rerank(self, question: str, docs: list[Document]) -> list[Document]:
         """Reorder dense candidates with the cross-encoder and keep the top_k."""
-        if not docs or self.reranker is None:
+        if not docs:
             return []
+        if self.reranker is None:
+            return docs[: self.top_k]
         request = RerankRequest(
             query=question,
             passages=[{"id": i, "text": doc.page_content} for i, doc in enumerate(docs)],
@@ -259,14 +259,28 @@ class RagEngine:
             top_docs.append(doc)
         return top_docs
 
+    @staticmethod
+    def _text_deltas(stream) -> Iterator[str]:
+        """Yield only the answer text deltas from an Interactions stream (skip thoughts)."""
+        for event in stream:
+            delta = getattr(event, "delta", None)
+            if delta is not None and getattr(delta, "type", None) == "text" and delta.text:
+                yield delta.text
+
     def stream(self, question: str, docs: list[Document]) -> Iterator[str]:
         """Yield answer text chunks grounded in the given documents."""
-        messages = PROMPT.invoke({"context": format_context(docs), "question": question})
-        for chunk in self.llm.stream(messages):
-            text = chunk.content
-            if isinstance(text, str) and text:
-                yield text
+        stream = self.client.interactions.create(
+            model=CHAT_MODEL,
+            input=_build_input(question, docs),
+            system_instruction=SYSTEM_INSTRUCTION,
+            stream=True,
+        )
+        yield from self._text_deltas(stream)
 
     def answer(self, question: str, docs: list[Document]) -> str:
-        messages = PROMPT.invoke({"context": format_context(docs), "question": question})
-        return self.llm.invoke(messages).content
+        result = self.client.interactions.create(
+            model=CHAT_MODEL,
+            input=_build_input(question, docs),
+            system_instruction=SYSTEM_INSTRUCTION,
+        )
+        return result.output_text

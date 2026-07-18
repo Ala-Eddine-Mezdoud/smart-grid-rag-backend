@@ -13,7 +13,15 @@ RUN uv sync --frozen
 
 COPY . .
 
-RUN sh -c 'set -a && [ -f .env ] && . ./.env && set +a && uv run ingest.py'
+# GEMINI_API_KEY is required at build time to embed the corpus during ingest.
+# Declared as ARG so Render passes the dashboard env var into the build (declare
+# the ARG, set the env var in Render's settings). It is set only in this builder
+# stage, which is discarded — the runtime image below never receives it.
+# Local build:  docker build --build-arg GEMINI_API_KEY=<key> -t smart-grid-rag .
+ARG GEMINI_API_KEY
+ENV GEMINI_API_KEY=${GEMINI_API_KEY}
+RUN uv run ingest.py
+
 RUN uv run python - <<'PY'
 from flashrank import Ranker
 
